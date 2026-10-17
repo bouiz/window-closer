@@ -115,6 +115,11 @@ button.mark { min-height: 64px; font-size: 1.25rem; }
 .thr-row output { text-align: center; font: 600 1.3rem var(--font-mono); font-variant-numeric: tabular-nums; }
 .thr-row output small { display: block; font: .75rem var(--font-body); color: var(--muted); }
 .hint { margin: 0; font-size: .85rem; color: var(--muted); }
+.auto-status { margin: 0; font: 600 1rem/1.35 var(--font-ui); }
+.auto-status[data-state="2"] { color: var(--accent); }
+.auto-status[data-state="3"], .auto-status[data-state="4"] { color: var(--stop); }
+.log-tools { display: flex; gap: 6px; }
+button.small { min-height: 0; padding: 2px 10px; font-size: .8rem; }
 
 /* Log */
 #log {
@@ -173,14 +178,26 @@ button.mark { min-height: 64px; font-size: 1.25rem; }
   </section>
 
   <section aria-labelledby="h-auto">
-    <h2 id="h-auto">Auto-close on loud sound</h2>
-    <button id="btn-arm" data-cmd="a" aria-pressed="false">Auto-close off</button>
+    <h2 id="h-auto">Auto mode</h2>
+    <button id="btn-arm" data-cmd="a" aria-pressed="false">Auto mode off — tap to turn on</button>
+    <p class="auto-status" id="auto-status" data-state="0">Off.</p>
+    <div class="progress" aria-hidden="true"><div id="auto-bar"></div></div>
+    <div class="thr-row">
+      <button id="btn-rise-down" data-cmd="[" aria-label="Lower rise trigger 0.25 dB per second">−</button>
+      <output id="rise">–<small>rise trigger, dB/s</small></output>
+      <button id="btn-rise-up" data-cmd="]" aria-label="Raise rise trigger 0.25 dB per second">+</button>
+    </div>
     <div class="thr-row">
       <button id="btn-thr-down" data-cmd="-" aria-label="Lower threshold 3 dB">−3</button>
-      <output id="thr">–<small>threshold dBFS</small></output>
+      <output id="thr">–<small>threshold, dBFS</small></output>
       <button id="btn-thr-up" data-cmd="+" aria-label="Raise threshold 3 dB">+3</button>
     </div>
-    <p class="hint" id="loud">Closes after 1.5 s above the threshold, then switches itself off.</p>
+    <div class="thr-row">
+      <button id="btn-reopen-down" data-cmd="{" aria-label="Shorten reopen delay 10 seconds">−10</button>
+      <output id="reopen">–<small>reopen delay, s</small></output>
+      <button id="btn-reopen-up" data-cmd="}" aria-label="Lengthen reopen delay 10 seconds">+10</button>
+    </div>
+    <p class="hint">Closes when the level climbs steadily by at least the rise trigger, or stays above the threshold for 1.5 s. Reopens once the level has been under the threshold for the reopen delay. A lower rise trigger closes earlier but also reacts to cars and other rising noises.</p>
   </section>
 
   <section aria-labelledby="h-mic">
@@ -192,7 +209,12 @@ button.mark { min-height: 64px; font-size: 1.25rem; }
   </section>
 
   <section aria-labelledby="h-log">
-    <h2 id="h-log">Messages <button id="btn-help" data-cmd="h" style="min-height:0;padding:2px 10px;font-size:.8rem">Help</button></h2>
+    <h2 id="h-log">Messages
+      <span class="log-tools">
+        <button id="btn-copy" class="small">Copy last 2 min</button>
+        <button id="btn-help" class="small" data-cmd="h">Help</button>
+      </span>
+    </h2>
     <pre id="log" aria-live="polite"></pre>
   </section>
 </main>
@@ -202,7 +224,6 @@ const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_RX      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // phone -> ESP32
 const NUS_TX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // ESP32 -> phone
 const MM_PER_S    = 15;      // rated actuator speed, for showing positions in mm
-const TRIGGER_BLOCKS = 15;   // matches the firmware (1.5 s)
 const DB_MIN = -90, DB_MAX = 0;
 const HISTORY = 300;         // 30 s at 10 readings per second
 
@@ -294,9 +315,12 @@ function onData(event) {
 function handleLine(line) {
   if (!line) return;
   if (line.startsWith('L,')) {
-    const [db, peak, armed, thr, loud, slot, pos, closed] = line.slice(2).split(',').map(Number);
-    updateLevel(db, peak, armed === 1, thr, loud, slot);
+    const [db, peak, armed, thr, slot, pos, closed, base, trend, state, progress, rise, reopenS] =
+      line.slice(2).split(',').map(Number);
+    updateLevel(db, peak, thr, slot, base, state);
+    updateAuto(armed === 1, state, base, trend, progress, rise, thr, reopenS);
     updatePosition(pos, closed);
+    record(db, base, trend, state);
   } else if (line.startsWith('M,')) {
     const [state, duration] = line.slice(2).split(',').map(Number);
     setMotion(state, duration);
@@ -307,23 +331,58 @@ function handleLine(line) {
 
 const pct = db => Math.max(0, Math.min(100, (db - DB_MIN) / (DB_MAX - DB_MIN) * 100));
 
-function updateLevel(db, peak, armed, thr, loud, slot) {
+function updateLevel(db, peak, thr, slot, base, state) {
   threshold = thr;
   $('db').textContent = db <= -139 ? '–∞' : db.toFixed(1);
   $('peak').textContent = peak <= -139 ? '–∞' : peak.toFixed(1);
   $('fill').style.width = pct(db) + '%';
   $('thr-mark').style.left = pct(thr) + '%';
   $('meter').classList.toggle('over', db > thr);
-  $('thr').firstChild.textContent = thr.toFixed(0);
   $('slot-label').textContent = 'mic slot ' + slot;
-  $('btn-arm').setAttribute('aria-pressed', armed);
-  $('btn-arm').textContent = armed ? 'Auto-close on — tap to turn off' : 'Auto-close off — tap to turn on';
-  $('loud').textContent = armed && loud > 0
-    ? `Loud for ${(loud / 10).toFixed(1)} s of ${(TRIGGER_BLOCKS / 10).toFixed(1)} s…`
-    : 'Closes after 1.5 s above the threshold, then switches itself off.';
-  history.push(db);
+  history.push({ db, base, state });
   if (history.length > HISTORY) history.shift();
   drawHistory();
+}
+
+// Auto states from the firmware: 0 off, 1 listening, 2 rising, 3 closed for a train,
+// 4 train passing with the window already closed by hand
+function updateAuto(armed, state, base, trend, progress, rise, thr, reopenS) {
+  $('btn-arm').setAttribute('aria-pressed', armed);
+  $('btn-arm').textContent = armed ? 'Auto mode on — tap to turn off' : 'Auto mode off — tap to turn on';
+  $('rise').firstChild.textContent = rise.toFixed(2);
+  $('thr').firstChild.textContent = thr.toFixed(0);
+  $('reopen').firstChild.textContent = reopenS;
+  const quietS = (progress / 1000).toFixed(0);
+  const trendText = (trend >= 0 ? '+' : '') + trend.toFixed(1) + ' dB/s';
+  const text = {
+    0: 'Off. Turn on to close for trains and reopen after they pass.',
+    1: `Listening. Background ${base.toFixed(0)} dB, trend ${trendText}.`,
+    2: `Level rising ${trendText}…`,
+    3: `Closed for a train. Reopens after ${reopenS} s under ${thr.toFixed(0)} dB (${quietS} s so far).`,
+    4: `Train passing. The window was already closed and stays closed (${quietS} of ${reopenS} s quiet).`,
+  }[state] ?? '';
+  $('auto-status').textContent = text;
+  $('auto-status').dataset.state = state;
+  $('auto-bar').style.width = state >= 3 ? Math.min(100, progress / (reopenS * 10)) + '%' : '0';
+}
+
+// Keeps the last 2 minutes of readings so they can be copied for tuning
+const RECORD_MAX = 1200;
+const records = [];
+function record(db, base, trend, state) {
+  records.push([new Date().toISOString().slice(11, 22), db, base, trend, state]);
+  if (records.length > RECORD_MAX) records.shift();
+}
+
+async function copyRecords() {
+  const csv = 'time,level_db,background_db,trend_db_per_s,auto_state\n' +
+    records.map(r => r.join(',')).join('\n');
+  try {
+    await navigator.clipboard.writeText(csv);
+    log(`Copied ${records.length} readings as CSV.`);
+  } catch (err) {
+    log('Copy failed: ' + err.message);
+  }
 }
 
 function drawHistory() {
@@ -352,17 +411,37 @@ function drawHistory() {
   ctx.beginPath(); ctx.moveTo(0, y(threshold) + .5); ctx.lineTo(w, y(threshold) + .5); ctx.stroke();
   ctx.setLineDash([]);
   if (history.length < 2) return;
-  // level trace, newest on the right
   const step = w / (HISTORY - 1);
   const x0 = w - (history.length - 1) * step;
+  // shade readings where auto mode saw a rise (light) or had closed for a train (stronger)
+  ctx.fillStyle = css.getPropertyValue('--stop');
+  const shade = p => p.state === 2 ? 1 : p.state >= 3 ? 2 : 0;
+  for (let i = 0; i < history.length;) {
+    const kind = shade(history[i]);
+    let j = i;
+    while (j < history.length && shade(history[j]) === kind) j++;
+    if (kind) {
+      ctx.globalAlpha = kind === 1 ? .12 : .22;
+      ctx.fillRect(x0 + (i - .5) * step, 0, (j - i) * step, h);
+    }
+    i = j;
+  }
+  ctx.globalAlpha = 1;
+  // background estimate
   ctx.beginPath();
-  history.forEach((v, i) => i ? ctx.lineTo(x0 + i * step, y(v)) : ctx.moveTo(x0, y(v)));
+  history.forEach((p, i) => i ? ctx.lineTo(x0 + i * step, y(p.base)) : ctx.moveTo(x0, y(p.base)));
+  ctx.strokeStyle = css.getPropertyValue('--muted');
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  // level trace, newest on the right
+  ctx.beginPath();
+  history.forEach((p, i) => i ? ctx.lineTo(x0 + i * step, y(p.db)) : ctx.moveTo(x0, y(p.db)));
   ctx.strokeStyle = css.getPropertyValue('--accent');
   ctx.lineWidth = 1.5;
   ctx.stroke();
   ctx.lineTo(w, h); ctx.lineTo(x0, h); ctx.closePath();
   ctx.globalAlpha = .15; ctx.fillStyle = css.getPropertyValue('--accent'); ctx.fill(); ctx.globalAlpha = 1;
-  const last = history[history.length - 1];
+  const last = history[history.length - 1].db;
   ctx.beginPath(); ctx.arc(w - 3, y(last), 3, 0, Math.PI * 2);
   ctx.fillStyle = css.getPropertyValue('--accent'); ctx.fill();
 }
@@ -432,6 +511,7 @@ document.addEventListener('visibilitychange', () => {
 
 cmdButtons.forEach(b => b.addEventListener('click', () => send(b.dataset.cmd)));
 $('connect').addEventListener('click', connect);
+$('btn-copy').addEventListener('click', copyRecords);
 window.addEventListener('resize', drawHistory);
 
 setStatus('disconnected', 'Not connected');

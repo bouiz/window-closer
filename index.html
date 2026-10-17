@@ -40,6 +40,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; }
 body {
   background: var(--bg);
@@ -103,6 +104,12 @@ canvas { width: 100%; height: 120px; display: block; border-radius: 6px; backgro
 .progress { height: 6px; border-radius: 3px; background: var(--bg); overflow: hidden; }
 .progress div { height: 100%; width: 0; background: var(--accent); }
 
+/* Calibration */
+.cal { display: grid; gap: 10px; }
+.cal-value { margin: 0; font: 600 .95rem/1.4 var(--font-mono); font-variant-numeric: tabular-nums; }
+.cal-step { margin: 0; font: 600 1.05rem/1.3 var(--font-ui); }
+button.mark { min-height: 64px; font-size: 1.25rem; }
+
 /* Auto-close */
 .thr-row { display: grid; grid-template-columns: 56px 1fr 56px; gap: 10px; align-items: center; }
 .thr-row output { text-align: center; font: 600 1.3rem var(--font-mono); font-variant-numeric: tabular-nums; }
@@ -141,14 +148,28 @@ canvas { width: 100%; height: 120px; display: block; border-radius: 6px; backgro
   </section>
 
   <section aria-labelledby="h-window">
-    <h2 id="h-window">Window <span>150 mm stroke · ~10 s</span></h2>
+    <h2 id="h-window">Window <span id="position">position unknown</span></h2>
     <div class="motion"><span id="motion-text">Idle</span><span id="motion-time"></span></div>
     <div class="progress" aria-hidden="true"><div id="motion-bar"></div></div>
     <div class="row">
-      <button id="btn-close" data-cmd="e">Close<br><small>extend</small></button>
-      <button id="btn-open" data-cmd="r">Open<br><small>retract</small></button>
+      <button id="btn-close" data-cmd="r">Close<br><small>retract to saved point</small></button>
+      <button id="btn-open" data-cmd="e">Open<br><small>extend fully</small></button>
     </div>
-    <button class="stop" id="btn-stop" data-cmd="s">STOP</button>
+    <button class="stop" id="btn-stop" data-cmd="s" data-always>STOP</button>
+  </section>
+
+  <section aria-labelledby="h-cal">
+    <h2 id="h-cal">Closed position</h2>
+    <p class="cal-value" id="closed-pos">Not set. Close retracts fully until you set it.</p>
+    <div id="cal-idle" class="cal">
+      <p class="hint">Extends fully, then retracts. Tap once when it is fully extended, and again the moment the window is closed.</p>
+      <button id="btn-cal" data-cmd="k">Set closed position</button>
+    </div>
+    <div id="cal-active" class="cal" hidden>
+      <p class="cal-step" id="cal-step"></p>
+      <button class="primary mark" id="btn-mark" data-cmd="s" data-always></button>
+      <button id="btn-cancel" data-cmd="x" data-always>Cancel calibration</button>
+    </div>
   </section>
 
   <section aria-labelledby="h-auto">
@@ -180,7 +201,7 @@ canvas { width: 100%; height: 120px; display: block; border-radius: 6px; backgro
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_RX      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // phone -> ESP32
 const NUS_TX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // ESP32 -> phone
-const STROKE_MS   = 11000;   // matches STROKE_TIME_MS in the firmware
+const MM_PER_S    = 15;      // rated actuator speed, for showing positions in mm
 const TRIGGER_BLOCKS = 15;   // matches the firmware (1.5 s)
 const DB_MIN = -90, DB_MAX = 0;
 const HISTORY = 300;         // 30 s at 10 readings per second
@@ -194,12 +215,17 @@ let threshold = -30;
 const history = [];
 let motion = 0, motionStart = 0, motionTimer = null, wakeLock = null;
 
+// While moving, only STOP and the calibration buttons are usable
+function updateEnabled() {
+  const connected = !!rxChar;
+  cmdButtons.forEach(b => b.disabled = !connected || (motion !== 0 && !('always' in b.dataset)));
+}
+
 function setStatus(state, text) {
   $('status').dataset.state = state;
   $('status').textContent = text;
-  const connected = state === 'connected';
-  cmdButtons.forEach(b => b.disabled = !connected);
-  $('connect').hidden = connected;
+  updateEnabled();
+  $('connect').hidden = state === 'connected';
   $('connect').disabled = state === 'connecting';
 }
 
@@ -268,10 +294,12 @@ function onData(event) {
 function handleLine(line) {
   if (!line) return;
   if (line.startsWith('L,')) {
-    const [db, peak, armed, thr, loud, slot] = line.slice(2).split(',').map(Number);
+    const [db, peak, armed, thr, loud, slot, pos, closed] = line.slice(2).split(',').map(Number);
     updateLevel(db, peak, armed === 1, thr, loud, slot);
+    updatePosition(pos, closed);
   } else if (line.startsWith('M,')) {
-    setMotion(Number(line.slice(2)));
+    const [state, duration] = line.slice(2).split(',').map(Number);
+    setMotion(state, duration);
   } else {
     log(line);
   }
@@ -339,22 +367,57 @@ function drawHistory() {
   ctx.fillStyle = css.getPropertyValue('--accent'); ctx.fill();
 }
 
-function setMotion(state) {
+const mm = ms => Math.round(ms * MM_PER_S / 1000);
+
+// Position is ms of retraction from full extension; retracting closes the window
+function updatePosition(pos, closed) {
+  $('closed-pos').textContent = closed >= 0
+    ? `≈ ${mm(closed)} mm · ${(closed / 1000).toFixed(2)} s retracted from full extension`
+    : 'Not set. Close retracts fully until you set it.';
+  let text;
+  if (pos < 0) text = 'position unknown';
+  else if (closed >= 0 && pos >= closed - 150) text = 'closed';
+  else if (pos <= 150) text = 'open, fully extended';
+  else text = `≈ ${mm(pos)} mm retracted`;
+  $('position').textContent = text;
+}
+
+const MOTION_TEXT = {
+  1: 'Opening (extending)…',
+  2: 'Closing (retracting)…',
+  3: 'Calibrating: extending…',
+  4: 'Calibrating: retracting…',
+};
+const CAL_STEP = {
+  3: ['Step 1 of 2: tap when the actuator is fully extended.', 'It’s fully extended'],
+  4: ['Step 2 of 2: tap the moment the window is closed.', 'Window is closed'],
+};
+
+function setMotion(state, duration) {
   motion = state;
   clearInterval(motionTimer);
+  updateEnabled();
   $('paused').hidden = state === 0;
+  const calibrating = state in CAL_STEP;
+  $('cal-idle').hidden = calibrating;
+  $('cal-active').hidden = !calibrating;
+  if (calibrating) {
+    $('cal-step').textContent = CAL_STEP[state][0];
+    $('btn-mark').textContent = CAL_STEP[state][1];
+  }
   if (state === 0) {
     $('motion-text').textContent = 'Idle';
     $('motion-time').textContent = '';
     $('motion-bar').style.width = '0';
     return;
   }
-  $('motion-text').textContent = state === 1 ? 'Closing (extending)…' : 'Opening (retracting)…';
+  $('motion-text').textContent = MOTION_TEXT[state] || 'Moving…';
   motionStart = Date.now();
   const tick = () => {
-    const t = Math.min(Date.now() - motionStart, STROKE_MS);
-    $('motion-time').textContent = (t / 1000).toFixed(1) + ' / ' + STROKE_MS / 1000 + ' s';
-    $('motion-bar').style.width = (t / STROKE_MS * 100) + '%';
+    const t = Math.min(Date.now() - motionStart, duration);
+    // Calibration runs until you tap, so its time limit isn't a meaningful target
+    $('motion-time').textContent = (t / 1000).toFixed(1) + (calibrating ? ' s' : ' / ' + (duration / 1000).toFixed(1) + ' s');
+    $('motion-bar').style.width = calibrating ? '0' : (t / duration * 100) + '%';
   };
   tick();
   motionTimer = setInterval(tick, 100);
